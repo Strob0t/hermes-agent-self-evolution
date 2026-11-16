@@ -49,6 +49,32 @@ python -m evolution.skills.evolve_skill \
     --eval-source sessiondb
 ```
 
+## Provider Configuration
+
+The LLM provider is configured separately from the code — nothing is hardcoded to OpenAI. All model construction goes through `evolution/core/lm.py` (`make_lm`), which reads these environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `EVOLUTION_API_BASE` | Base URL of any OpenAI-compatible endpoint (Bifrost, LiteLLM proxy, vLLM, local gateway). |
+| `EVOLUTION_API_KEY` | API key the endpoint expects. |
+| `EVOLUTION_OPTIMIZER_MODEL` | Model id for GEPA reflections (e.g. `openai/gpt-4.1`). CLI `--optimizer-model` overrides it. |
+| `EVOLUTION_EVAL_MODEL` | Model id for evaluation/judging. CLI `--eval-model` overrides it. |
+| `COPILOT_GITHUB_TOKEN` | Optional: use GitHub Copilot models via the `copilot/<model>` prefix instead of a gateway. |
+
+Example — route everything through a local Bifrost / LiteLLM gateway (keeps all traffic internal, no direct OpenAI calls):
+
+```bash
+cp .env.example .env            # then edit the values
+export EVOLUTION_API_BASE=http://127.0.0.1:8080/v1
+export EVOLUTION_API_KEY=changeme
+export EVOLUTION_OPTIMIZER_MODEL=openai/gpt-4.1
+export EVOLUTION_EVAL_MODEL=openai/gpt-4.1-mini
+
+python -m evolution.skills.evolve_skill --skill github-code-review --iterations 10 --eval-source synthetic
+```
+
+Explicit CLI flags (`--optimizer-model`, `--eval-model`) take precedence over the environment.
+
 ## What It Optimizes
 
 | Phase | Target | Engine | Status |
