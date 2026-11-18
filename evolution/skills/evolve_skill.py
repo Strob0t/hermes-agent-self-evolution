@@ -141,6 +141,48 @@ def _evaluate_holdout(holdout_examples, baseline_module, optimized_module, judge
     return baseline_scores, evolved_scores, holdout_errors
 
 
+STYLE_RULES_MAX_CHARS = 12000
+
+
+def _build_style_instructions() -> Optional[str]:
+    """Build a mandatory STE style section from EVOLUTION_STYLE_RULES_FILES.
+
+    Returns None when the env is not set or any listed file is missing, so the
+    default proposer behaviour stays unchanged.
+    """
+    raw = os.environ.get("EVOLUTION_STYLE_RULES_FILES", "").strip()
+    if not raw:
+        return None
+    paths = [p.strip() for p in raw.split(",") if p.strip()]
+    if not paths:
+        return None
+    texts: list[str] = []
+    for p in paths:
+        try:
+            texts.append(Path(p).read_text(encoding="utf-8"))
+        except OSError as exc:
+            console.print(
+                f"[yellow]⚠ Style rules file missing or unreadable, using default proposer: {p} ({exc})[/yellow]"
+            )
+            return None
+    # Cut to a maximum of STYLE_RULES_MAX_CHARS characters in total.
+    chunks: list[str] = []
+    total = 0
+    for text in texts:
+        remaining = STYLE_RULES_MAX_CHARS - total
+        if remaining <= 0:
+            break
+        text = text[:remaining]
+        chunks.append(text)
+        total += len(text)
+    console.print(f"Style rules: {len(chunks)} files, {total} chars")
+    rules = "\n\n".join(chunks)
+    return (
+        "Write the new instructions in ASD-STE100 Simplified Technical English. "
+        "Use these rules:\n" + rules
+    )
+
+
 def evolve(
     skill_name: Optional[str] = None,
     iterations: int = 10,
@@ -312,16 +354,31 @@ def evolve(
         return score
 
     reflection_lm = make_lm(optimizer_model)
+    style_instructions = _build_style_instructions()
     gepa = getattr(dspy, "GEPA", None)
     if gepa is not None:
-        optimizer = gepa(
+        gepa_kwargs = dict(
             metric=optimization_metric,
             # Bound the budget by metric calls, not optimizer steps.
             max_metric_calls=max(1, iterations) * max(1, len(valset)) + len(valset),
             reflection_lm=reflection_lm,
         )
+        if style_instructions is not None:
+            # The built-in proposer applies additional_instructions to every proposal.
+            from dspy.teleprompt.gepa import InstructionProposer
+
+            gepa_kwargs["instruction_proposer"] = InstructionProposer(
+                additional_instructions=style_instructions
+            )
+        optimizer = gepa(**gepa_kwargs)
     else:
         console.print("[yellow]GEPA not available, falling back to MIPROv2[/yellow]")
+        # MIPROv2 has no single parameter to inject mandatory proposal
+        # instructions, so the style section is not applied to this fallback.
+        if style_instructions is not None:
+            console.print(
+                "[yellow]⚠ Style rules not applied: MIPROv2 fallback has no instruction parameter[/yellow]"
+            )
         optimizer = dspy.MIPROv2(
             metric=optimization_metric,
             prompt_model=reflection_lm,
