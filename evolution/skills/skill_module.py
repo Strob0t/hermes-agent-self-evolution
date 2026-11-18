@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import dspy
+from dspy.utils.exceptions import AdapterParseError
 
 
 def load_skill(skill_path: Path) -> dict:
@@ -107,7 +108,15 @@ class SkillModule(dspy.Module):
         return self.predictor.signature.instructions
 
     def forward(self, task_input: str) -> dspy.Prediction:
-        result = self.predictor(task_input=task_input)
+        try:
+            result = self.predictor(task_input=task_input)
+        except AdapterParseError as exc:
+            # Models sometimes answer in plain text without the [[ ## output ## ]] marker.
+            raw = getattr(exc, "lm_response", None)
+            raw = raw.strip() if isinstance(raw, str) else ""
+            if not raw:
+                raise
+            return dspy.Prediction(output=raw, skill_text=self.skill_text)
         return dspy.Prediction(output=result.output, skill_text=self.skill_text)
 
 

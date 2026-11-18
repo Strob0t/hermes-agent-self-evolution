@@ -111,6 +111,36 @@ def _merge_tokens(phases: dict) -> dict:
     return merged
 
 
+def _evaluate_holdout(holdout_examples, baseline_module, optimized_module, judge_metric, lm):
+    """Score both modules per example; one failing example scores 0.0 instead of aborting the run."""
+    baseline_scores = []
+    evolved_scores = []
+    holdout_errors = {"baseline": 0, "evolved": 0}
+    for i, ex in enumerate(holdout_examples):
+        with dspy.context(lm=lm):
+            try:
+                baseline_pred = baseline_module(task_input=ex.task_input)
+                baseline_scores.append(judge_metric(ex, baseline_pred))
+            except Exception as exc:
+                baseline_scores.append(0.0)
+                holdout_errors["baseline"] += 1
+                console.print(f"  [yellow]holdout example {i}: baseline failed ({type(exc).__name__})[/yellow]")
+
+            try:
+                evolved_pred = optimized_module(task_input=ex.task_input)
+                evolved_scores.append(judge_metric(ex, evolved_pred))
+            except Exception as exc:
+                evolved_scores.append(0.0)
+                holdout_errors["evolved"] += 1
+                console.print(f"  [yellow]holdout example {i}: evolved failed ({type(exc).__name__})[/yellow]")
+
+    console.print(f"  Holdout errors: baseline={holdout_errors['baseline']}, evolved={holdout_errors['evolved']}")
+    total = len(baseline_scores)
+    if total and holdout_errors["baseline"] == total and holdout_errors["evolved"] == total:
+        raise click.ClickException("holdout evaluation failed for all examples")
+    return baseline_scores, evolved_scores, holdout_errors
+
+
 def evolve(
     skill_name: Optional[str] = None,
     iterations: int = 10,
@@ -341,19 +371,9 @@ def evolve(
 
     holdout_examples = dataset.to_dspy_examples("holdout")
 
-    baseline_scores = []
-    evolved_scores = []
     with _phase(phases, "holdout"):
-        for ex in holdout_examples:
-            # Score baseline
-            with dspy.context(lm=lm):
-                baseline_pred = baseline_module(task_input=ex.task_input)
-                baseline_score = judge_metric(ex, baseline_pred)
-                baseline_scores.append(baseline_score)
-
-                evolved_pred = optimized_module(task_input=ex.task_input)
-                evolved_score = judge_metric(ex, evolved_pred)
-                evolved_scores.append(evolved_score)
+        baseline_scores, evolved_scores, holdout_errors = _evaluate_holdout(
+            holdout_examples, baseline_module, optimized_module, judge_metric, lm)
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
     avg_evolved = sum(evolved_scores) / max(1, len(evolved_scores))
@@ -413,6 +433,8 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "holdout_errors_baseline": holdout_errors["baseline"],
+        "holdout_errors_evolved": holdout_errors["evolved"],
         "apply_requested": apply,
         "applied": False,
         "source_path": str(found),
