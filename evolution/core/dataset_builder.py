@@ -18,6 +18,172 @@ from evolution.core.lm import make_lm
 from evolution.core.config import EvolutionConfig
 
 
+# Up to this many model calls are made to collect enough test cases.
+MAX_GENERATION_ATTEMPTS = 3
+# An attempt is good when it yields at least this many valid cases, so that
+# train, val and holdout each receive one after the split.
+MIN_VALID_CASES = 3
+
+_YELLOW = "\033[33m"
+_RESET = "\033[0m"
+
+
+def _strip_code_fence(text: str) -> str:
+    """Remove a leading markdown code fence, with or without a closing fence."""
+    s = text.strip()
+    if not s.startswith("```"):
+        return s
+    newline = s.find("\n")
+    if newline == -1:
+        # Only a fence marker, no content.
+        return ""
+    s = s[newline + 1:].rstrip()
+    if s.endswith("```"):
+        s = s[:-3]
+    return s.strip()
+
+
+def _as_case_list(obj) -> Optional[list]:
+    """Coerce a decoded JSON value to a list of cases.
+
+    Accept a list directly. Accept a dict that wraps exactly one list value,
+    for example ``{"test_cases": [...]}``.
+    """
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        list_values = [v for v in obj.values() if isinstance(v, list)]
+        if len(list_values) == 1:
+            return list_values[0]
+    return None
+
+
+def _remove_trailing_commas(s: str) -> str:
+    """Drop a comma that sits before a closing ``}`` or ``]``.
+
+    A comma inside a JSON string value is kept, so a comma or bracket that is
+    part of a string stays unchanged.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    n = len(s)
+    for i, ch in enumerate(s):
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j < n and s[j] in "}]":
+                continue
+            out.append(ch)
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _salvage_objects(s: str) -> list:
+    """Decode top-level ``{...}`` objects from the first ``[`` onward.
+
+    Stop at the first object that does not decode (for example text that was
+    cut at the output limit) and keep the objects decoded so far.
+    """
+    start = s.find("[")
+    if start == -1:
+        return []
+    decoder = json.JSONDecoder()
+    idx = start + 1
+    n = len(s)
+    results: list = []
+    while idx < n:
+        while idx < n and s[idx] in " \t\r\n,":
+            idx += 1
+        if idx >= n or s[idx] == "]":
+            break
+        if s[idx] != "{":
+            break
+        try:
+            obj, end = decoder.raw_decode(s, idx)
+        except json.JSONDecodeError:
+            break
+        results.append(obj)
+        idx = end
+    return results
+
+
+def _parse_with_step(text: str) -> tuple[list[dict], str]:
+    """Parse model test-case text and report which step succeeded.
+
+    Steps run in sequence; the first that yields one or more dicts wins.
+    Returns ``([], "none")`` when nothing parses. Never raises for ``str``.
+    """
+    if not isinstance(text, str):
+        return [], "none"
+
+    stripped = _strip_code_fence(text)
+
+    def dicts_of(cand) -> list[dict]:
+        if not cand:
+            return []
+        return [c for c in cand if isinstance(c, dict)]
+
+    # b. Full-text JSON (list, or dict wrapping one list).
+    try:
+        result = dicts_of(_as_case_list(json.loads(stripped)))
+        if result:
+            return result, "full"
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    first = stripped.find("[")
+    last = stripped.rfind("]")
+    if first != -1 and last != -1 and last > first:
+        part = stripped[first:last + 1]
+        # c. JSON of the first ``[`` to the last ``]``.
+        try:
+            result = dicts_of(_as_case_list(json.loads(part)))
+            if result:
+                return result, "bracket"
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # d. Same part after removing trailing commas.
+        try:
+            result = dicts_of(_as_case_list(json.loads(_remove_trailing_commas(part))))
+            if result:
+                return result, "repair"
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # e. Salvage whole objects until the first one that does not decode.
+    result = dicts_of(_salvage_objects(stripped))
+    if result:
+        return result, "salvage"
+
+    return [], "none"
+
+
+def parse_test_cases(text: str) -> list[dict]:
+    """Parse model output into a list of test-case dicts.
+
+    Tolerant of fenced code, surrounding prose, a dict wrapper, trailing
+    commas, and output that was cut mid-array. Returns ``[]`` when no dict can
+    be parsed. Never raises for a ``str`` input.
+    """
+    return _parse_with_step(text)[0]
+
+
 @dataclass
 class EvalExample:
     """A single evaluation example."""
@@ -126,42 +292,66 @@ class SyntheticDatasetBuilder:
         # Configure DSPy to use the judge model for generation
         lm = make_lm(self.config.judge_model)
 
-        with dspy.context(lm=lm):
-            result = self.generator(
+        examples: list[EvalExample] = []
+        for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+            # A repeated call with identical inputs would return the cached first
+            # answer. dspy 3.4.1 bypasses its caches when rollout_id changes and
+            # temperature>0 (dspy/clients/lm.py: "Different values bypass DSPy's
+            # caches"; "rollout_id has no effect when temperature=0"). The first
+            # attempt keeps the default request; later attempts vary rollout_id.
+            call_kwargs = dict(
                 artifact_text=artifact_text,
                 artifact_type=artifact_type,
                 num_cases=n,
             )
+            if attempt > 1:
+                call_kwargs["config"] = dict(rollout_id=attempt, temperature=1.0)
 
-        # Parse the generated test cases
-        try:
-            cases_raw = json.loads(result.test_cases)
-        except json.JSONDecodeError:
-            # Try to extract JSON from the response
-            import re
-            match = re.search(r'\[.*\]', result.test_cases, re.DOTALL)
-            if match:
-                cases_raw = json.loads(match.group())
-            else:
-                raise ValueError(f"Could not parse test cases from LLM output: {result.test_cases[:200]}")
+            with dspy.context(lm=lm):
+                result = self.generator(**call_kwargs)
 
-        examples = [
-            EvalExample(
-                task_input=c.get("task_input", ""),
-                expected_behavior=c.get("expected_behavior", ""),
-                difficulty=c.get("difficulty", "medium"),
-                category=c.get("category", "general"),
-                source="synthetic",
+            raw = result.test_cases if isinstance(result.test_cases, str) else str(result.test_cases)
+            cases_raw, step = _parse_with_step(raw)
+
+            examples = [
+                EvalExample(
+                    task_input=c.get("task_input", ""),
+                    expected_behavior=c.get("expected_behavior", ""),
+                    difficulty=c.get("difficulty", "medium"),
+                    category=c.get("category", "general"),
+                    source="synthetic",
+                )
+                for c in cases_raw
+                if c.get("task_input") and c.get("expected_behavior")
+            ]
+
+            if len(examples) >= MIN_VALID_CASES:
+                break
+
+            print(
+                f"{_YELLOW}Dataset attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: "
+                f"{len(examples)} valid cases, parse step {step}, raw length {len(raw)}{_RESET}"
             )
-            for c in cases_raw
-            if c.get("task_input") and c.get("expected_behavior")
-        ]
+            print(f"{_YELLOW}  raw[:200]: {raw[:200]!r}{_RESET}")
+            print(f"{_YELLOW}  raw[-200:]: {raw[-200:]!r}{_RESET}")
+        else:
+            raise ValueError(
+                f"Could not get {MIN_VALID_CASES} valid test cases from the model "
+                f"after {MAX_GENERATION_ATTEMPTS} attempts"
+            )
 
-        # Shuffle and split
+        # Shuffle and split. With at least MIN_VALID_CASES (3) examples and the
+        # default 0.5/0.25 ratios, train/val/holdout each get one. Guard the
+        # holdout for arbitrary ratios: when 3+ examples exist it must not be
+        # empty, so cap train+val so at least one example is left for holdout.
         random.shuffle(examples)
         n_total = len(examples)
         n_train = max(1, int(n_total * self.config.train_ratio))
         n_val = max(1, int(n_total * self.config.val_ratio))
+        if n_total >= 3 and n_train + n_val >= n_total:
+            n_val = max(1, n_total - n_train - 1)
+            if n_train + n_val >= n_total:
+                n_train = n_total - n_val - 1
 
         return EvalDataset(
             train=examples[:n_train],
